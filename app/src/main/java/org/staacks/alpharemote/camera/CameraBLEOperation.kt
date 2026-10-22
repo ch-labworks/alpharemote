@@ -6,7 +6,9 @@ sealed class CameraBLEOperation
 
 data class CameraBLEWrite(
     val characteristic: BluetoothGattCharacteristic,
-    val data: ByteArray
+    val data: ByteArray,
+    val step: CameraActionStep,
+    val safetyRelease: Boolean = false
 ) : CameraBLEOperation()
 
 data class CameraBLERead(

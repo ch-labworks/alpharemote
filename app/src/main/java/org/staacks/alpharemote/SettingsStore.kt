@@ -41,10 +41,18 @@ class SettingsStore(context: Context) {
     private val advancedControlsIntervalEnabled = booleanPreferencesKey("advancedControlsIntervalEnabled")
     private val advancedControlsIntervalCount = intPreferencesKey("advancedControlsIntervalCount")
     private val advancedControlsIntervalDuration = doublePreferencesKey("advancedControlsIntervalDuration")
+    private val advancedControlsIntervalRefocus = booleanPreferencesKey("advancedControlsIntervalRefocus")
     private val advancedControlsFocusBracketingEnabled = booleanPreferencesKey("advancedControlsBracketingEnabled")
     private val advancedControlsFocusBracketingAmount = doublePreferencesKey("advancedControlsBracketingAmount")
 
     private val broadcastControlKey = booleanPreferencesKey("broadcastControl")
+    private val selfTimerSoundKey = booleanPreferencesKey("selfTimerSound")
+
+    val selfTimerSound: Flow<Boolean> = settings.data.map { it[selfTimerSoundKey] ?: true }.distinctUntilChanged()
+
+    suspend fun setSelfTimerSound(enabled: Boolean) {
+        settings.edit { it[selfTimerSoundKey] = enabled }
+    }
 
     private fun <T> setNullable(data: MutablePreferences, key: Preferences.Key<T>, value: T?) {
         if (value == null) {
@@ -203,6 +211,7 @@ class SettingsStore(context: Context) {
         var intervalDuration: Double,
         var focusBracketingEnabled: Boolean,
         var focusBracketingAmount: Double,
+        var intervalRefocus: Boolean = false,
     )
 
     data class AdvancedControlsStateOptional (
@@ -213,6 +222,7 @@ class SettingsStore(context: Context) {
         var intervalDuration: Double?,
         var focusBracketingEnabled: Boolean?,
         var focusBracketingAmount: Double?,
+        var intervalRefocus: Boolean? = null,
     )
 
     suspend fun setAdvancedControlsState(state: AdvancedControlsStateOptional) {
@@ -231,6 +241,9 @@ class SettingsStore(context: Context) {
             }
             state.intervalDuration?.let {
                 data[advancedControlsIntervalDuration] = it
+            }
+            state.intervalRefocus?.let {
+                data[advancedControlsIntervalRefocus] = it
             }
             state.focusBracketingEnabled?.let {
                 data[advancedControlsFocusBracketingEnabled] = it
@@ -251,6 +264,7 @@ class SettingsStore(context: Context) {
                 it?.get(advancedControlsIntervalDuration) ?: 3.0,
                 it?.get(advancedControlsFocusBracketingEnabled) ?: false,
                 it?.get(advancedControlsFocusBracketingAmount) ?: 2.0,
+                it?.get(advancedControlsIntervalRefocus) ?: false,
             )
         }
     }

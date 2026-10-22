@@ -76,6 +76,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     val buttonScaleSteps = listOf(0.6f, 0.7f, 0.85f, 1.0f, 1.15f, 1.3f, 1.5f)
     var buttonScaleIndex = MutableStateFlow(buttonScaleSteps.indexOf(1.0f))
     var broadcastControl = MutableStateFlow(false)
+    val selfTimerSound = MutableStateFlow(true)
 
     val customButtonListFlow = MutableStateFlow<List<CameraAction>?>(null)
 
@@ -86,6 +87,9 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     )
 
     init {
+        viewModelScope.launch {
+            settingsStore.selfTimerSound.collect { selfTimerSound.value = it }
+        }
         viewModelScope.launch {
             settingsStore.getNotificationButtonSize()?.let {
                 val i = buttonScaleSteps.indexOf(it)
@@ -262,5 +266,11 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
             broadcastControl.value = isChecked
             settingsStore.setBroadcastControl(isChecked)
         }
+    }
+
+    fun setSelfTimerSound(button: CompoundButton, isChecked: Boolean) {
+        if (selfTimerSound.value == isChecked) return
+        selfTimerSound.value = isChecked
+        viewModelScope.launch { settingsStore.setSelfTimerSound(isChecked) }
     }
 }

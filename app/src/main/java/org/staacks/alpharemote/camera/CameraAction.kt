@@ -39,7 +39,7 @@ data class CameraAction (
     fun getPressStepList(context: Context): List<CameraActionStep> {
         return if (selftimer != null) {
             val label = context.getString(R.string.self_timer)
-            listOf(CACountdown(label, selftimer)) + applyStepToStepList(preset.template.press)
+            listOf(CACountdown(label, selftimer, audible = true)) + applyStepToStepList(preset.template.press)
         } else {
             applyStepToStepList(preset.template.press)
         }

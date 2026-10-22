@@ -229,6 +229,28 @@
                     />
 
 
+                <com.google.android.material.checkbox.MaterialCheckBox
+                    android:id="@+id/interval_refocus"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:text="@string/camera_advanced_interval_refocus"
+                    android:checked="@={viewModel.intervalRefocus}"
+                    android:enabled="@{viewModel.intervalToggle &amp;&amp; !viewModel.focusBracketingToggle}"
+                    android:alpha="@{viewModel.intervalToggle &amp;&amp; !viewModel.focusBracketingToggle ? 1.0f : 0.5f}"
+                    app:layout_constraintStart_toStartOf="@id/interval_toggle"
+                    app:layout_constraintEnd_toEndOf="parent"
+                    app:layout_constraintTop_toBottomOf="@id/interval_duration" />
+
+                <TextView
+                    android:id="@+id/interval_refocus_note"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:text="@string/camera_advanced_interval_refocus_note"
+                    android:alpha="@{viewModel.intervalToggle ? 1.0f : 0.5f}"
+                    app:layout_constraintStart_toStartOf="@id/interval_toggle"
+                    app:layout_constraintEnd_toEndOf="parent"
+                    app:layout_constraintTop_toBottomOf="@id/interval_refocus" />
+
                 <ImageView
                     android:id="@+id/focus_bracketing_icon"
                     android:layout_width="wrap_content"
@@ -249,7 +271,7 @@
                     app:layout_constraintStart_toStartOf="@id/bulb_toggle"
                     app:layout_constraintEnd_toEndOf="parent"
                     android:checked="@={viewModel.focusBracketingToggle}"
-                    app:layout_constraintTop_toBottomOf="@id/interval_duration"
+                    app:layout_constraintTop_toBottomOf="@id/interval_refocus_note"
                     android:gravity="start|center_vertical"
                     android:textAppearance="@style/TextAppearance.AppCompat.Subhead"
                     />
@@ -329,7 +351,7 @@
                     app:layout_constraintEnd_toEndOf="parent"
                     android:gravity="center_horizontal|center_vertical"
                     android:onClick="@{() -> viewModel.startAdvancedSequence()}"
-                    android:text="@{viewModel.uiState.serviceState.countdown == null ? @string/camera_advanced_start : @string/camera_advanced_abort}"
+                    android:text="@{viewModel.uiState.serviceState.countdown != null || viewModel.uiState.serviceState.pendingTriggerCount > 0 ? @string/camera_advanced_abort : @string/camera_advanced_start}"
                     android:enabled="@{viewModel.bulbToggle || viewModel.intervalToggle}"
                     />
             </androidx.constraintlayout.widget.ConstraintLayout>

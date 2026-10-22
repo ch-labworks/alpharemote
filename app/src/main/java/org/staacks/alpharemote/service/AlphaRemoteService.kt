@@ -1,9 +1,7 @@
 package org.staacks.alpharemote.service
 
 import android.Manifest
-import android.annotation.SuppressLint
 import android.companion.AssociationInfo
-import android.companion.CompanionDeviceManager
 import android.companion.CompanionDeviceService
 import android.content.Context
 import android.content.Intent
@@ -12,6 +10,8 @@ import android.content.pm.ServiceInfo
 import android.content.res.Configuration
 import android.os.PowerManager
 import android.os.SystemClock
+import android.os.Build
+import androidx.annotation.RequiresApi
 import android.util.Log
 import androidx.core.app.ActivityCompat
 import org.staacks.alpharemote.MainActivity
@@ -25,13 +25,16 @@ import org.staacks.alpharemote.camera.CAWaitFor
 import org.staacks.alpharemote.camera.CameraAction
 import org.staacks.alpharemote.camera.CameraActionStep
 import org.staacks.alpharemote.camera.CameraBLE
+import org.staacks.alpharemote.camera.normalizeCameraAddress
 import org.staacks.alpharemote.camera.CameraStateIdentified
 import org.staacks.alpharemote.camera.CameraStateReady
-import org.staacks.alpharemote.camera.WaitTarget
+import org.staacks.alpharemote.camera.ReportedBoolean
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancelChildren
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -40,37 +43,45 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import org.staacks.alpharemote.camera.CameraActionPreset
-import org.staacks.alpharemote.camera.JogCode
-import org.staacks.alpharemote.ui.settings.CompanionDeviceHelper
 import java.io.Serializable
 import java.util.LinkedList
-import java.util.Timer
-import java.util.TimerTask
-import kotlin.concurrent.schedule
-import kotlin.math.max
-import kotlin.math.roundToLong
 
 
 class AlphaRemoteService : CompanionDeviceService() {
     private val job = SupervisorJob()
-    private val scope = CoroutineScope(Dispatchers.IO + job)
+    private val scope = CoroutineScope(Dispatchers.Main.immediate + job)
 
-    private var timer: TimerTask? = null
+    private var timer: Job? = null
+    private var connectionCollector: Job? = null
+    private var wakeLockRenewal: Job? = null
+    private var manualHoldTimeout: Job? = null
+    private var waitingFor: CAWaitFor? = null
+    private var focusBeforePress: ReportedBoolean? = null
+    private var sequenceGeneration = 0L
     private var notificationUI: NotificationUI? = null
+    private lateinit var selfTimerSound: SelfTimerSound
+    private var selfTimerSoundEnabled = false
 
     private lateinit var pendingActionsWakeLock: PowerManager.WakeLock
+    private var cameraBLE: CameraBLE? = null
+    private val presence = CameraPresence()
+    private var disposingConnection = false
+    private val pendingActionSteps = LinkedList<CameraActionStep>()
 
     companion object {
 
-        private var cameraBLE: CameraBLE? = null
-        private var deviceAppearedCount = 0
+        private var activeService: AlphaRemoteService? = null
 
         private val _serviceState = MutableStateFlow<ServiceState>(ServiceStateGone())
         val serviceState: StateFlow<ServiceState> = _serviceState.asStateFlow()
 
         fun disconnect() {
-            cameraBLE?.disconnectFromDevice()
+            activeService?.let { service ->
+                service.scope.launch {
+                    service.disposeConnection()
+                    service.stopSelf()
+                }
+            }
         }
 
         fun sendCameraAction(context: Context, cameraAction: CameraAction, down: Boolean = true, up: Boolean = true) {
@@ -94,16 +105,28 @@ class AlphaRemoteService : CompanionDeviceService() {
         const val ADVANCED_SEQUENCE_INTENT_BULB_DURATION_EXTRA = "duration"
         const val ADVANCED_SEQUENCE_INTENT_INTERVAL_DURATION_EXTRA = "interval"
         const val ADVANCED_SEQUENCE_INTENT_INTERVAL_COUNT_EXTRA = "count"
+        const val ADVANCED_SEQUENCE_INTENT_INTERVAL_REFOCUS_EXTRA = "refocus"
         const val ADVANCED_SEQUENCE_INTENT_FOCUS_BRACKETING_AMOUNT_EXTRA = "focus_step"
 
-        private var pendingActionSteps = LinkedList<CameraActionStep>()
         var broadcastControl = false
     }
 
     override fun onCreate() {
         super.onCreate()
+        activeService = this
         pendingActionsWakeLock = (getSystemService(POWER_SERVICE) as PowerManager).run {
             newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AlphaRemoteService::PendingActionsWakeLock")
+        }
+        pendingActionsWakeLock.setReferenceCounted(false)
+        selfTimerSound = SelfTimerSound(applicationContext, scope)
+        scope.launch {
+            SettingsStore(application).selfTimerSound.collect { enabled ->
+                selfTimerSoundEnabled = enabled
+                val step = pendingActionSteps.peek() as? CACountdown
+                val deadline = (serviceState.value as? ServiceRunning)?.countdown
+                if (enabled && step?.audible == true && deadline != null) selfTimerSound.start(deadline)
+                else selfTimerSound.stop()
+            }
         }
     }
 
@@ -112,6 +135,8 @@ class AlphaRemoteService : CompanionDeviceService() {
         try {
             super.onDeviceAppeared(address) //This is abstract on Android 12
         } catch (_: AbstractMethodError) {}
+        if (cameraBLE != null && cameraBLE?.address != normalizeCameraAddress(address)) return
+        presence.nearby = true
 
         if (ActivityCompat.checkSelfPermission(applicationContext, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
             Log.w(MainActivity.TAG, "Missing Bluetooth permission. Launching activity instead.")
@@ -146,36 +171,43 @@ class AlphaRemoteService : CompanionDeviceService() {
 
         if (cameraBLE == null) {
             cancelPendingActionSteps()
-            deviceAppearedCount = 1
-            cameraBLE = CameraBLE(scope, application, address, ::onConnect, ::onDisconnect).apply {
-                scope.launch {
-                    cameraState.collect {
-                        when (it) {
-                            is CameraStateReady -> checkWaitAction(it)
-                            is CameraStateIdentified -> settingsStore.setCameraId(it.name, it.address)
-                            else -> cancelPendingActionSteps()
-                        }
-                    }
+            val client = CameraBLE(
+                scope, application, address, ::onConnect, ::onDisconnect, ::onOperationsDrained,
+                onActionFailed = { reason ->
+                    Log.w(MainActivity.TAG, "Cancelling camera action without disconnecting: $reason")
+                    cancelPendingActionSteps()
                 }
-                scope.launch {
-                    cameraState.collectLatest { cameraState ->
-                        _serviceState.update {
-                            (it as? ServiceRunning)?.copy(cameraState = cameraState) ?: ServiceRunning(cameraState, null, null)
+            )
+            cameraBLE = client
+            connectionCollector = scope.launch {
+                client.cameraState.collect { cameraState ->
+                    if (cameraBLE !== client) return@collect
+                    _serviceState.update {
+                        (it as? ServiceRunning)?.copy(cameraState = cameraState) ?: ServiceRunning(cameraState, null, null)
+                    }
+                    notificationUI?.onCameraStateUpdate(cameraState)
+                    when (cameraState) {
+                        is CameraStateReady -> {
+                            checkWaitAction(cameraState)
+                            updateManualHoldTimeout(cameraState)
+                            updateWakeLock()
                         }
-                        notificationUI?.onCameraStateUpdate(cameraState)
+                        is CameraStateIdentified -> settingsStore.setCameraId(cameraState.name, cameraState.address)
+                        else -> cancelPendingActionSteps()
                     }
                 }
             }
+            client.start()
         } else {
             Log.w(MainActivity.TAG, "onDeviceAppeared ignored as cameraBLE has already been instantiated.")
-            deviceAppearedCount++
+            cameraBLE?.start()
             return
         }
     }
 
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
     override fun onDeviceAppeared(associationInfo: AssociationInfo) {
-        super.onDeviceAppeared(associationInfo)
-        Log.d(MainActivity.TAG, "API33 onDeviceAppeared: $associationInfo")
+        associationInfo.deviceMacAddress?.toString()?.let { onDeviceAppeared(it) }
     }
 
     override fun onDeviceDisappeared(address: String) {
@@ -183,26 +215,25 @@ class AlphaRemoteService : CompanionDeviceService() {
         try {
             super.onDeviceDisappeared(address) //This is abstract on Android 12
         } catch (_: AbstractMethodError) {}
-        deviceAppearedCount--
-
-        if (deviceAppearedCount == 0) {
-            cameraBLE?.disconnectFromDevice()
-            cameraBLE = null
-            if (pendingActionsWakeLock.isHeld) {
-                pendingActionsWakeLock.release()
+        if (cameraBLE?.address == normalizeCameraAddress(address)) {
+            presence.nearby = false
+            if (presence.canDispose) {
+                disposeConnection()
+                stopSelf()
+            } else {
+                Log.i(MainActivity.TAG, "Companion advertising disappeared; retaining the active Bluetooth connection")
             }
-            job.cancelChildren()
-            stopSelf()
         }
     }
 
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
     override fun onDeviceDisappeared(associationInfo: AssociationInfo) {
-        super.onDeviceDisappeared(associationInfo)
-        Log.d(MainActivity.TAG, "API33 onDeviceDisappeared: $associationInfo")
+        associationInfo.deviceMacAddress?.toString()?.let { onDeviceDisappeared(it) }
     }
 
     private fun onConnect() {
         Log.d(MainActivity.TAG, "onConnect")
+        presence.connected = true
         notificationUI?.let {
             startForeground(
                 it.notificationId,
@@ -214,11 +245,42 @@ class AlphaRemoteService : CompanionDeviceService() {
 
     private fun onDisconnect() {
         Log.d(MainActivity.TAG, "onDisconnect")
-        _serviceState.value = ServiceStateGone()
+        presence.connected = false
+        if (!disposingConnection && presence.canDispose) {
+            disposeConnection()
+            stopSelf()
+            return
+        }
         cancelPendingActionSteps()
+        cameraBLE?.cameraState?.value?.let { state ->
+            _serviceState.value = ServiceRunning(state, null, null)
+        }
         stopForeground(STOP_FOREGROUND_REMOVE)
         notificationUI?.stop()
+        // Retain the auto-connect client while the companion device is present.
+    }
+
+    private fun disposeConnection() {
+        if (disposingConnection) return
+        disposingConnection = true
+        cancelPendingActionSteps()
+        connectionCollector?.cancel()
+        connectionCollector = null
+        cameraBLE?.disconnectFromDevice()
         cameraBLE = null
+        _serviceState.value = ServiceStateGone()
+        releaseWakeLock()
+        presence.clear()
+        disposingConnection = false
+    }
+
+    override fun onDestroy() {
+        disposeConnection()
+        scope.cancel()
+        notificationUI?.stop()
+        if (activeService === this) activeService = null
+        broadcastControl = false
+        super.onDestroy()
     }
 
     private fun executeCameraAction(cameraAction: CameraAction, down: Boolean, up: Boolean) {
@@ -229,7 +291,7 @@ class AlphaRemoteService : CompanionDeviceService() {
         if (cameraAction.toggle) {
             translatedDown = false // Toggle only acts on button release. Do not pass through down events
             if (translatedUp) {
-                ((serviceState.value as? ServiceRunning)?.cameraState as? CameraStateReady)?.let { cameraState ->
+                (cameraBLE?.cameraState?.value as? CameraStateReady)?.let { cameraState ->
                     translatedUp = cameraAction.preset.template.referenceButton in cameraState.pressedButtons
                     translatedDown = !translatedUp
                 }
@@ -246,6 +308,7 @@ class AlphaRemoteService : CompanionDeviceService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(MainActivity.TAG, "onStartCommand: $intent")
+        if (cameraBLE?.cameraState?.value !is CameraStateReady) return START_NOT_STICKY
         when (intent?.action) {
             BUTTON_INTENT_ACTION -> {
                 val cameraAction = intent.getSerializableExtra(BUTTON_INTENT_CAMERA_ACTION_EXTRA) as CameraAction
@@ -259,45 +322,18 @@ class AlphaRemoteService : CompanionDeviceService() {
                 val intervalDuration = intent.getSerializableExtra(ADVANCED_SEQUENCE_INTENT_INTERVAL_DURATION_EXTRA) as Float
                 val intervalCount = intent.getSerializableExtra(ADVANCED_SEQUENCE_INTENT_INTERVAL_COUNT_EXTRA) as Int
                 val focusBracketingAmount = intent.getSerializableExtra(ADVANCED_SEQUENCE_INTENT_FOCUS_BRACKETING_AMOUNT_EXTRA) as Float
-
-                val stepSequencePrepare: MutableList<CameraActionStep> = mutableListOf()
-                stepSequencePrepare += CAButton(pressed = true, ButtonCode.SHUTTER_HALF)
-                if (intervalDuration > 0) {
-                    stepSequencePrepare += CACountdown(getString(R.string.camera_advanced_interval_timer_label), intervalDuration)
+                if (listOf(bulbDuration, intervalDuration, focusBracketingAmount).any { SequenceSafety.countdownMillis(it) == null }) {
+                    Log.w(MainActivity.TAG, "Invalid sequence duration")
+                    return START_NOT_STICKY
                 }
 
-                val stepSequenceTrigger: MutableList<CameraActionStep> = mutableListOf()
-                stepSequenceTrigger += CAButton(pressed = true, ButtonCode.SHUTTER_FULL, isSequenceTrigger = true)
-                if (bulbDuration > 0) {
-                    stepSequenceTrigger += CAWaitFor(WaitTarget.SHUTTER)
-                }
-                stepSequenceTrigger += CAButton(pressed = false, ButtonCode.SHUTTER_FULL)
-                stepSequenceTrigger += CAButton(pressed = false, ButtonCode.SHUTTER_HALF)
-                if (bulbDuration > 0) {
-                    stepSequenceTrigger += listOf(
-                        CACountdown(getString(R.string.camera_advanced_bulb_timer_label), bulbDuration),
-                        CAButton(pressed = true, ButtonCode.SHUTTER_HALF),
-                        CAButton(pressed = true, ButtonCode.SHUTTER_FULL),
-                        CAButton(pressed = false, ButtonCode.SHUTTER_FULL),
-                        CAButton(pressed = false, ButtonCode.SHUTTER_HALF),
-                    )
-                }
-
-                val focusSequence = if (focusBracketingAmount > 0) {
-                    listOf(
-                        CAWaitFor(WaitTarget.SHUTTER, true), //Wait for the exposure to finish
-                        CAButton(pressed = true, ButtonCode.SHUTTER_HALF), //Dismiss immediate preview by half pressing shutter
-                        CAButton(pressed = false, ButtonCode.SHUTTER_HALF),
-                        CAJog(true, JogCode.FOCUS_FAR.maxStep, JogCode.FOCUS_FAR),
-                        CACountdown(getString(R.string.camera_advanced_focus_bracketing_timer_label), focusBracketingAmount),
-                        CAJog(false, JogCode.FOCUS_FAR.maxStep, JogCode.FOCUS_FAR)
-                    )
-                } else listOf()
-
-                startCameraAction(
-                    stepSequencePrepare + stepSequenceTrigger
-                            + List(max(intervalCount-1, 0)) {stepSequencePrepare + focusSequence + stepSequenceTrigger}.flatten()
-                )
+                startCameraAction(advancedSequence(
+                    bulbDuration, intervalDuration, intervalCount, focusBracketingAmount,
+                    intent.getBooleanExtra(ADVANCED_SEQUENCE_INTENT_INTERVAL_REFOCUS_EXTRA, false),
+                    getString(R.string.camera_advanced_interval_timer_label),
+                    getString(R.string.camera_advanced_bulb_timer_label),
+                    getString(R.string.camera_advanced_focus_bracketing_timer_label),
+                ))
             }
         }
 
@@ -315,28 +351,24 @@ class AlphaRemoteService : CompanionDeviceService() {
         }
     }
 
-    @Synchronized
     fun cancelPendingActionSteps(): Boolean {
-        var pendingStepsCancelled = false
+        val pendingStepsCancelled = pendingActionSteps.isNotEmpty()
+        sequenceGeneration++
         timer?.cancel()
-        if (pendingActionSteps.isNotEmpty()) {
-            pendingActionSteps.clear()
-            for (button in ButtonCode.entries) {
-                cameraBLE?.executeCameraActionStep(CAButton(false, button))
-            }
-            for (jog in JogCode.entries) {
-                cameraBLE?.executeCameraActionStep(CAJog(false, -1, jog))
-            }
-            pendingStepsCancelled = true
-            updatePendingActionStatistics()
-        }
+        timer = null
+        selfTimerSound.stop()
+        waitingFor = null
+        focusBeforePress = null
+        manualHoldTimeout?.cancel()
+        manualHoldTimeout = null
+        pendingActionSteps.clear()
+        // Discard unsent presses first; keep an accepted write serialized ahead of releases.
+        cameraBLE?.releaseAllControls()
+        updatePendingActionStatistics()
         _serviceState.update {
             (it as? ServiceRunning)?.copy(countdown = null, countdownLabel = null) ?: it
         }
         notificationUI?.hideCountdown()
-        if (pendingActionsWakeLock.isHeld) {
-            pendingActionsWakeLock.release()
-        }
         return pendingStepsCancelled
     }
 
@@ -351,64 +383,77 @@ class AlphaRemoteService : CompanionDeviceService() {
         return false
     }
 
-    @Synchronized
-    @SuppressLint("WakelockTimeout")
     fun startCameraAction(steps: List<CameraActionStep>) {
-        if (cancelPendingActionSteps() && isLongRunningSequence(steps))
-            return //If this is more than a simple button press and there were pending action, this button press is only used as a cancellation of the previous sequence
-        pendingActionSteps.addAll(steps)
-        if (!pendingActionsWakeLock.isHeld) {
-            pendingActionsWakeLock.acquire()
+        if (cameraBLE?.cameraState?.value !is CameraStateReady) return
+        if (steps.any { it is CACountdown && SequenceSafety.countdownMillis(it.duration) == null }) {
+            cancelPendingActionSteps()
+            return
         }
+        // Short press/release pairs already in GATT must stay ordered during a normal click.
+        if (pendingActionSteps.isNotEmpty() || steps.isEmpty()) {
+            if (cancelPendingActionSteps() && isLongRunningSequence(steps)) return
+        }
+        pendingActionSteps.addAll(steps)
+        updateWakeLock()
         executeNextCameraActionStep()
     }
 
-    @Synchronized
     fun updatePendingActionStatistics() {
         var pendingTriggerCount = 0
         for (actionStep in pendingActionSteps) {
             if (actionStep is CAButton && actionStep.isSequenceTrigger)
                 pendingTriggerCount++
         }
-        if (pendingActionSteps.isEmpty() && pendingActionsWakeLock.isHeld) {
-            pendingActionsWakeLock.release()
-        }
+        updateWakeLock()
         _serviceState.update {
             (it as? ServiceRunning)?.copy(pendingTriggerCount = pendingTriggerCount) ?: it
         }
     }
 
-    @Synchronized
     fun executeNextCameraActionStep() {
         updatePendingActionStatistics()
         while ((pendingActionSteps.peek() is CAButton || pendingActionSteps.peek() is CAJog)) {
             pendingActionSteps.poll()?.let {
                 updatePendingActionStatistics()
+                if (it is CAButton && it.pressed && it.button == ButtonCode.SHUTTER_HALF) {
+                    focusBeforePress = (cameraBLE?.cameraState?.value as? CameraStateReady)?.focus
+                }
                 cameraBLE?.executeCameraActionStep(it)
             }
         }
+        updatePendingActionStatistics()
+        (cameraBLE?.cameraState?.value as? CameraStateReady)?.let { updateManualHoldTimeout(it) }
         (pendingActionSteps.peek() as? CACountdown)?.let { step ->
-            val time = (step.duration * 1000).roundToLong()
+            val time = SequenceSafety.countdownMillis(step.duration) ?: run {
+                cancelPendingActionSteps()
+                return
+            }
+            if (time == 0L) {
+                pendingActionSteps.removeFirst()
+                executeNextCameraActionStep()
+                return
+            }
             timer?.cancel()
-            timer = Timer().schedule(time) {
-                countdownActionComplete()
+            val generation = sequenceGeneration
+            timer = scope.launch {
+                delay(time)
+                if (generation == sequenceGeneration && pendingActionSteps.peek() === step) countdownActionComplete()
             }
             val targetTime = SystemClock.elapsedRealtime() + time
             _serviceState.update {
                 (it as? ServiceRunning)?.copy(countdown = targetTime, countdownLabel = step.label) ?: it
             }
             notificationUI?.showCountdown(targetTime, step.label)
+            if (step.audible && selfTimerSoundEnabled) selfTimerSound.start(targetTime)
+            else selfTimerSound.stop()
             return
         }
-        (serviceState.value as? ServiceRunning)?.let {
-            (it.cameraState as? CameraStateReady)?.let { cameraState ->
-                checkWaitAction(cameraState)
-            }
-        }
+        // Arm the wait directly from the client; persisting camera identity can suspend its collector.
+        (cameraBLE?.cameraState?.value as? CameraStateReady)?.let { checkWaitAction(it) }
     }
 
-    @Synchronized
     fun countdownActionComplete() {
+        selfTimerSound.stop()
         _serviceState.update {
             (it as? ServiceRunning)?.copy(countdown = null, countdownLabel = null) ?: it
         }
@@ -420,25 +465,70 @@ class AlphaRemoteService : CompanionDeviceService() {
         }
     }
 
-    @Synchronized
     fun checkWaitAction(state: CameraStateReady) {
-        val nextAction = pendingActionSteps.peek()
-        if (nextAction is CAWaitFor) {
-            when (nextAction.target) {
-                WaitTarget.FOCUS -> if (state.focus.state != nextAction.invert) {
-                    pendingActionSteps.removeFirst()
-                    executeNextCameraActionStep()
-                }
-                WaitTarget.SHUTTER -> if (state.shutter.state != nextAction.invert) {
-                    pendingActionSteps.removeFirst()
-                    executeNextCameraActionStep()
-                }
-                WaitTarget.RECORDING -> if (state.recording.state != nextAction.invert) {
-                    pendingActionSteps.removeFirst()
-                    executeNextCameraActionStep()
+        val nextAction = pendingActionSteps.peek() as? CAWaitFor ?: return
+        if (nextAction.isSatisfiedBy(state, focusBeforePress, cameraBLE?.hasPendingOperations == true)) {
+            timer?.cancel()
+            timer = null
+            waitingFor = null
+            pendingActionSteps.removeFirst()
+            executeNextCameraActionStep()
+        } else if (waitingFor !== nextAction) {
+            waitingFor = nextAction
+            timer?.cancel()
+            val generation = sequenceGeneration
+            timer = scope.launch {
+                delay(SequenceSafety.waitTimeoutMillis(nextAction))
+                if (generation == sequenceGeneration && pendingActionSteps.peek() === nextAction) {
+                    Log.w(MainActivity.TAG, "Timed out waiting for ${nextAction.target}")
+                    cancelPendingActionSteps()
                 }
             }
         }
+    }
+
+    private fun hasUnsafeHold(state: CameraStateReady?): Boolean = state != null &&
+            (ButtonCode.SHUTTER_FULL in state.pressedButtons || state.pressedJogs.isNotEmpty())
+
+    private fun updateManualHoldTimeout(state: CameraStateReady) {
+        if (pendingActionSteps.isNotEmpty() || !hasUnsafeHold(state)) {
+            manualHoldTimeout?.cancel()
+            manualHoldTimeout = null
+        } else if (manualHoldTimeout == null) {
+            manualHoldTimeout = scope.launch {
+                delay(SequenceSafety.MANUAL_HOLD_TIMEOUT_MS)
+                Log.w(MainActivity.TAG, "Releasing remote controls after a missing button-up event")
+                cancelPendingActionSteps()
+            }
+        }
+    }
+
+    private fun onOperationsDrained() {
+        (cameraBLE?.cameraState?.value as? CameraStateReady)?.let { checkWaitAction(it) }
+        updateWakeLock()
+    }
+
+    private fun updateWakeLock() {
+        val state = cameraBLE?.cameraState?.value as? CameraStateReady
+        val needsPower = pendingActionSteps.isNotEmpty() || cameraBLE?.hasPendingOperations == true || hasUnsafeHold(state)
+        if (!needsPower) {
+            releaseWakeLock()
+        } else if (wakeLockRenewal == null) {
+            // A lost callback or a blocked dispatcher cannot leave an indefinite Android wake lock.
+            pendingActionsWakeLock.acquire(SequenceSafety.WAKE_LOCK_LEASE_MS)
+            wakeLockRenewal = scope.launch {
+                while (true) {
+                    delay(SequenceSafety.WAKE_LOCK_RENEWAL_MS)
+                    pendingActionsWakeLock.acquire(SequenceSafety.WAKE_LOCK_LEASE_MS)
+                }
+            }
+        }
+    }
+
+    private fun releaseWakeLock() {
+        wakeLockRenewal?.cancel()
+        wakeLockRenewal = null
+        if (pendingActionsWakeLock.isHeld) pendingActionsWakeLock.release()
     }
 
 }

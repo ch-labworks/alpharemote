@@ -34,6 +34,7 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     var intervalToggle: ObservableField<Boolean> = ObservableField(false)
     var intervalCount: ObservableField<Int?> = ObservableField(50)
     var intervalDuration: ObservableField<Double?> = ObservableField(3.0)
+    var intervalRefocus: ObservableField<Boolean> = ObservableField(false)
     var focusBracketingToggle: ObservableField<Boolean> = ObservableField(false)
     var focusBracketingAmount: ObservableField<Double?> = ObservableField(2.0)
 
@@ -47,7 +48,8 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                     intervalCount.get(),
                     intervalDuration.get(),
                     focusBracketingToggle.get(),
-                    focusBracketingAmount.get()
+                    focusBracketingAmount.get(),
+                    intervalRefocus.get()
                 )
             )
         }
@@ -97,11 +99,13 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
                 intervalCount.set(saved.intervalCount)
                 intervalToggle.set(saved.intervalEnabled)
                 intervalDuration.set(saved.intervalDuration)
+                intervalRefocus.set(saved.intervalRefocus)
                 focusBracketingToggle.set(saved.focusBracketingEnabled)
                 focusBracketingAmount.set(saved.focusBracketingAmount)
             }
             bulbToggle.addOnPropertyChangedCallback(advancedControlsChangedCallback)
             intervalToggle.addOnPropertyChangedCallback(advancedControlsChangedCallback)
+            intervalRefocus.addOnPropertyChangedCallback(advancedControlsChangedCallback)
             focusBracketingToggle.addOnPropertyChangedCallback(advancedControlsChangedCallback)
             AlphaRemoteService.serviceState.collectLatest {
                 (it as? ServiceRunning)?.also { serviceRunning ->

@@ -290,6 +290,8 @@ class CameraFragment : Fragment() {
                 putExtra(AlphaRemoteService.ADVANCED_SEQUENCE_INTENT_BULB_DURATION_EXTRA, bulbDuration.toFloat())
                 putExtra(AlphaRemoteService.ADVANCED_SEQUENCE_INTENT_INTERVAL_COUNT_EXTRA, intervalCount)
                 putExtra(AlphaRemoteService.ADVANCED_SEQUENCE_INTENT_INTERVAL_DURATION_EXTRA, intervalDuration.toFloat())
+                putExtra(AlphaRemoteService.ADVANCED_SEQUENCE_INTENT_INTERVAL_REFOCUS_EXTRA,
+                    vm.intervalToggle.get() == true && vm.intervalRefocus.get() == true && vm.focusBracketingToggle.get() != true)
                 putExtra(AlphaRemoteService.ADVANCED_SEQUENCE_INTENT_FOCUS_BRACKETING_AMOUNT_EXTRA, focusBracketingAmount.toFloat())
             }
 

@@ -6,13 +6,27 @@ sealed class CameraActionStep
 
 data class CACountdown (
     val label: String,
-    val duration: Float
+    val duration: Float,
+    val audible: Boolean = false
 ) : CameraActionStep()
 
 data class CAWaitFor (
     val target: WaitTarget,
-    val invert: Boolean = false
-) : CameraActionStep()
+    val invert: Boolean = false,
+    val requireFreshFocus: Boolean = false,
+) : CameraActionStep() {
+    fun isSatisfiedBy(state: CameraStateReady, focusBeforePress: ReportedBoolean?, operationsPending: Boolean): Boolean {
+        val reported = when (target) {
+            WaitTarget.FOCUS -> state.focus
+            WaitTarget.SHUTTER -> state.shutter
+            WaitTarget.RECORDING -> state.recording
+        }
+        // Focus reports are replaced on every notification. Identity avoids clock-resolution
+        // races and rejects the previous shot's focus success, even if it is still true.
+        if (requireFreshFocus && (operationsPending || reported === focusBeforePress)) return false
+        return reported.lastChange != null && reported.state != invert
+    }
+}
 
 data class CAButton (
     val pressed: Boolean,

@@ -1,14 +1,13 @@
 package org.staacks.alpharemote.camera
 
-import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
-import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -16,400 +15,435 @@ import android.content.IntentFilter
 import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import org.staacks.alpharemote.MainActivity
 import java.util.UUID
-import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.experimental.and
 
-// Massive thanks to coral for the documentation of the camera's BLE protocol at
-// https://github.com/coral/freemote
-// and to Greg Leeds at
+// Sony's remote protocol: https://github.com/coral/freemote
 // https://gregleeds.com/reverse-engineering-sony-camera-bluetooth/
-
-class CameraBLE(val scope: CoroutineScope, context: Context, val address: String, val onConnect: () -> Unit, val onDisconnect: () -> Unit) {
-
-    val genericAccessServiceUUID = UUID.fromString("00001800-0000-1000-8000-00805f9b34fb")!!
-    val nameCharacteristicUUID = UUID.fromString("00002a00-0000-1000-8000-00805f9b34fb")!!
-
-    val remoteServiceUUID = UUID.fromString("8000ff00-ff00-ffff-ffff-ffffffffffff")!!
-    val commandCharacteristicUUID = UUID.fromString("0000ff01-0000-1000-8000-00805f9b34fb")!!
-    val statusCharacteristicUUID = UUID.fromString("0000ff02-0000-1000-8000-00805f9b34fb")!!
-
-    private val configDescriptorUUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")!!
-
-    var remoteService: BluetoothGattService? = null
-    var commandCharacteristic: BluetoothGattCharacteristic? = null
-    var statusCharacteristic: BluetoothGattCharacteristic? = null
-
-    private val operationQueue = ConcurrentLinkedQueue<CameraBLEOperation>()
-    private var currentOperation: CameraBLEOperation? = null
+// All connection, queue and state mutations run on the main dispatcher.
+class CameraBLE(
+    scope: CoroutineScope,
+    context: Context,
+    address: String,
+    private val onConnect: () -> Unit,
+    private val onDisconnect: () -> Unit,
+    private val onOperationsDrained: () -> Unit = {},
+    private val onActionFailed: (String) -> Unit = {}
+) {
+    val address: String = normalizeCameraAddress(address)
+    private val context = context.applicationContext
+    private val connectionScope = CoroutineScope(
+        scope.coroutineContext + SupervisorJob(scope.coroutineContext[Job]) + Dispatchers.Main.immediate
+    )
+    private val remoteServiceUUID = UUID.fromString("8000ff00-ff00-ffff-ffff-ffffffffffff")
+    private val commandCharacteristicUUID = UUID.fromString("0000ff01-0000-1000-8000-00805f9b34fb")
+    private val statusCharacteristicUUID = UUID.fromString("0000ff02-0000-1000-8000-00805f9b34fb")
+    private val genericAccessServiceUUID = UUID.fromString("00001800-0000-1000-8000-00805f9b34fb")
+    private val nameCharacteristicUUID = UUID.fromString("00002a00-0000-1000-8000-00805f9b34fb")
+    private val configDescriptorUUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+    private val adapter = (this.context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
+    private var device: BluetoothDevice? = null
+    private val connection = BLEConnectionOwner<BluetoothGatt>(
+        disconnect = {
+            try { it.disconnect() } catch (e: SecurityException) {
+                Log.w(MainActivity.TAG, "Bluetooth disconnect failed", e)
+            }
+        },
+        close = {
+            try { it.close() } catch (e: SecurityException) {
+                Log.w(MainActivity.TAG, "Bluetooth close failed", e)
+            }
+        }
+    )
+    private val gatt: BluetoothGatt? get() = connection.client
+    private var commandCharacteristic: BluetoothGattCharacteristic? = null
+    private var statusCharacteristic: BluetoothGattCharacteristic? = null
+    private var name: String? = null
+    private val disposed: Boolean get() = connection.disposed
+    private var recoveryAttempts = 0
+    private var recoveryJob: Job? = null
+    private var discoveryTimeout: Job? = null
+    private var rediscoverRequested = false
+    private val pendingControls = PendingCameraControls()
 
     private val _cameraState = MutableStateFlow<CameraState>(CameraStateGone())
     val cameraState: StateFlow<CameraState> = _cameraState.asStateFlow()
 
-    private var name: String? = null
-
-    private var bluetoothAdapter: BluetoothAdapter = (context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
-
-    private var device: BluetoothDevice? = null
-    private var gatt: BluetoothGatt? = null
-
-    private val bluetoothGattCallback = object : BluetoothGattCallback() {
-        override fun onConnectionStateChange(gatt: BluetoothGatt?, status: Int, newState: Int) {
-            Log.d(MainActivity.TAG, "onConnectionStateChange: status $status, newState $newState")
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                onConnect()
-                try {
-                    gatt?.discoverServices()
-                } catch (e: SecurityException) {
-                    Log.e(MainActivity.TAG, e.toString())
-                    _cameraState.value = CameraStateError(e)
-                }
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                notifyDisconnect()
+    private val operations = BLEOperationQueue<CameraBLEOperation>(
+        start = ::startOperation,
+        scheduleTimeout = { expired ->
+            val timeout = connectionScope.launch {
+                delay(OPERATION_TIMEOUT_MS)
+                expired()
             }
-        }
-
-        override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) {
-            Log.d(MainActivity.TAG, "onServicesDiscovered")
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                remoteService = gatt?.getService(remoteServiceUUID)
-                commandCharacteristic = remoteService?.getCharacteristic(commandCharacteristicUUID)
-                statusCharacteristic = remoteService?.getCharacteristic(statusCharacteristicUUID)
-                val nameCharacteristic = gatt?.getService(genericAccessServiceUUID)?.getCharacteristic(nameCharacteristicUUID)
-                if (statusCharacteristic != null && commandCharacteristic != null && nameCharacteristic != null) {
-                    statusCharacteristic?.let {
-                        enqueueOperation(CameraBLERead(nameCharacteristic){ status, value ->
-                            if (status == BluetoothGatt.GATT_SUCCESS) {
-                                val newName = value.toString(Charsets.UTF_8)
-                                _cameraState.value = CameraStateIdentified(newName, address)
-                                name = newName
-                            } // Fail state ignored. This commonly fails if a camera sends an onStateChange few ms after connection and Android restarts service discovery just when we are trying to read this value. After the new service discovery we will get back here anyway. If this fails for a different reason, not knowing the model name is not fatal.
-                        })
-                        enqueueOperation(CameraBLESubscribe(it))
-                    }
-                } else {
-                    _cameraState.value = CameraStateError(null, "Remote service not found.")
-                    Log.e(MainActivity.TAG, "remoteService: " + remoteService.toString())
-                    Log.e(MainActivity.TAG, "commandCharacteristic: " + commandCharacteristic.toString())
-                    Log.e(MainActivity.TAG, "statusCharacteristic: " + statusCharacteristic.toString())
-                    Log.e(MainActivity.TAG, "nameCharacteristic: " + nameCharacteristic.toString())
-                    notifyDisconnect()
-                }
+            val cancel: () -> Unit = { timeout.cancel() }
+            cancel
+        },
+        onFailure = ::failConnection,
+        onIdle = ::operationsDrained,
+        onRejected = { operation, reason ->
+            if (operation is CameraBLEWrite && cameraState.value is CameraStateReady) {
+                commandFailed(operation, reason)
             } else {
-                Log.e(MainActivity.TAG, "discovery failed: $status")
-                _cameraState.value = CameraStateError(null, "Service discovery failed.")
-                //Note, at this point the service will not be usable, but we stay connected as this might be recoverable.
-                //In fact, newer cameras seem to send an onServiceChanged to bonded devices after few ms, which triggers Android to restart discovery.
-                //If this was the reason for this discovery to fail, onServiceChanged will be called soon where discoverServices will be called again.
+                failConnection(reason)
+            }
+        }
+    )
+    val hasPendingOperations: Boolean get() = operations.isBusy
+
+    /** Check ownership after dispatch, so posted callbacks from a replaced client are ignored too. */
+    private fun dispatch(client: BluetoothGatt?, action: () -> Unit) {
+        connectionScope.launch {
+            if (connection.owns(client)) action()
+        }
+    }
+
+    private val callback = object : BluetoothGattCallback() {
+        override fun onConnectionStateChange(gatt: BluetoothGatt?, status: Int, newState: Int) = dispatch(gatt) {
+            if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
+                try {
+                    onConnect()
+                } catch (e: RuntimeException) {
+                    failConnection("Could not start camera service: ${e.message}")
+                    return@dispatch
+                }
+                discoverServices()
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                // Retain one auto-connect client while Android still sees the companion device.
+                resetConnectionState()
+                _cameraState.value = CameraStateGone()
+                onDisconnect()
+            } else if (status != BluetoothGatt.GATT_SUCCESS) {
+                failConnection("Bluetooth connection failed ($status).")
             }
         }
 
-        override fun onServiceChanged(gatt: BluetoothGatt) {
-            super.onServiceChanged(gatt)
-            Log.d(MainActivity.TAG, "onServiceChanged")
-            resetOperationQueue()
-            try {
-                gatt.discoverServices()
-            }  catch (e: SecurityException) {
-                Log.e(MainActivity.TAG, e.toString())
-                _cameraState.value = CameraStateError(e)
+        override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) = dispatch(gatt) {
+            if (rediscoverRequested) return@dispatch
+            discoveryTimeout?.cancel()
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                failConnection("Service discovery failed ($status).")
+                return@dispatch
             }
+            val remote = gatt?.getService(remoteServiceUUID)
+            commandCharacteristic = remote?.getCharacteristic(commandCharacteristicUUID)
+            statusCharacteristic = remote?.getCharacteristic(statusCharacteristicUUID)
+            val statusChar = statusCharacteristic
+            if (commandCharacteristic == null || statusChar == null) {
+                failConnection("Remote service not found.")
+                return@dispatch
+            }
+            gatt?.getService(genericAccessServiceUUID)?.getCharacteristic(nameCharacteristicUUID)?.let { characteristic ->
+                enqueue(CameraBLERead(characteristic) { result, value ->
+                    if (result == BluetoothGatt.GATT_SUCCESS) {
+                        name = value.toString(Charsets.UTF_8)
+                        _cameraState.value = CameraStateIdentified(name!!, address)
+                    }
+                })
+            }
+            enqueue(CameraBLESubscribe(statusChar))
         }
 
-        override fun onCharacteristicWrite(
-            gatt: BluetoothGatt?,
-            characteristic: BluetoothGattCharacteristic?,
-            status: Int
-        ) {
-            super.onCharacteristicWrite(gatt, characteristic, status)
-            cameraBLEWriteComplete(status)
+        override fun onServiceChanged(gatt: BluetoothGatt) = dispatch(gatt) {
+            // Drain the accepted request before discovery. Starting a new request immediately
+            // could misattribute the old callback to the same characteristic after discovery.
+            rediscoverRequested = true
+            _cameraState.value = CameraStateConnecting()
+            operations.discardPending()
+            if (!operations.isBusy) operationsDrained()
+        }
+
+        override fun onCharacteristicWrite(gatt: BluetoothGatt?, characteristic: BluetoothGattCharacteristic?, status: Int) = dispatch(gatt) {
+            finishWrite(characteristic, status)
         }
 
         @Deprecated("Deprecated in Java")
-        @Suppress("DEPRECATION", "Used for backwards compatibility on API<33")
-        override fun onCharacteristicRead(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            status: Int
-        ) {
-            super.onCharacteristicRead(gatt, characteristic, status)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
-                return //Use the new version of onCharacteristicRead instead
-            Log.d(MainActivity.TAG, "Deprecated onCharacteristicRead with status $status from ${characteristic.uuid}.")
-            cameraBLEReadComplete(status, characteristic.value)
+        @Suppress("DEPRECATION")
+        override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                val value = characteristic.value?.clone() ?: byteArrayOf()
+                dispatch(gatt) { finishRead(characteristic, status, value) }
+            }
         }
 
-        override fun onCharacteristicRead(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            value: ByteArray,
-            status: Int
-        ) {
-            super.onCharacteristicRead(gatt, characteristic, value, status)
-            Log.d(MainActivity.TAG, "onCharacteristicRead with status $status from ${characteristic.uuid}.")
-            cameraBLEReadComplete(status, value)
-        }
+        override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray, status: Int) =
+            dispatch(gatt) { finishRead(characteristic, status, value) }
 
-        override fun onDescriptorWrite(
-            gatt: BluetoothGatt?,
-            descriptor: BluetoothGattDescriptor?,
-            status: Int
-        ) {
-            super.onDescriptorWrite(gatt, descriptor, status)
-            cameraBLESubscribeComplete(status)
+        override fun onDescriptorWrite(gatt: BluetoothGatt?, descriptor: BluetoothGattDescriptor?, status: Int) = dispatch(gatt) {
+            operations.complete({ it is CameraBLESubscribe && descriptor?.uuid == configDescriptorUUID && descriptor.characteristic === it.characteristic }) {
+                if (rediscoverRequested) return@complete
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    _cameraState.value = CameraStateReady(name, ReportedBoolean(), ReportedBoolean(), ReportedBoolean(), emptySet(), emptySet())
+                    // Clear any remote hold left behind by an interrupted connection.
+                    releaseAllControls()
+                } else {
+                    failConnection("Status subscription failed ($status).")
+                }
+            }
         }
 
         @Deprecated("Deprecated in Java")
-        @Suppress("DEPRECATION", "Used for backwards compatibility on API<33")
-        override fun onCharacteristicChanged(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic
-        ) {
-            super.onCharacteristicChanged(gatt, characteristic)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
-                return //Use the new version of onCharacteristicRead instead
-            Log.d(MainActivity.TAG, "Deprecated onCharacteristicChanged from ${characteristic.uuid}.")
-            if (characteristic == statusCharacteristic) {
-                onCameraStatusUpdate(characteristic.value)
+        @Suppress("DEPRECATION")
+        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                val value = characteristic.value?.clone() ?: byteArrayOf()
+                dispatch(gatt) { if (characteristic === statusCharacteristic) updateStatus(value) }
             }
         }
 
-        override fun onCharacteristicChanged(
-            gatt: BluetoothGatt,
-            characteristic: BluetoothGattCharacteristic,
-            value: ByteArray
-        ) {
-            super.onCharacteristicChanged(gatt, characteristic, value)
-            Log.d(MainActivity.TAG, "onCharacteristicChanged from ${characteristic.uuid}.")
-            if (characteristic == statusCharacteristic) {
-                onCameraStatusUpdate(value)
-            }
-        }
+        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) =
+            dispatch(gatt) { if (characteristic === statusCharacteristic) updateStatus(value) }
     }
 
     private val bondStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            Log.d(MainActivity.TAG, "CameraBLE received BluetoothDevice.ACTION_BOND_STATE_CHANGED.")
-            try {
-                if (cameraState.value is CameraStateReady && device?.bondState != BluetoothDevice.BOND_BONDED) {
-                    _cameraState.value = CameraStateNotBonded()
-                    Log.e(MainActivity.TAG, "Camera became unbonded while in use.")
-                } else if (cameraState.value is CameraStateNotBonded && device?.bondState == BluetoothDevice.BOND_BONDED) {
-                    Log.e(MainActivity.TAG, "Camera is now bonded.")
-                    connectToDevice(context)
+            connectionScope.launch {
+                if (disposed) return@launch
+                try {
+                    if (device?.bondState == BluetoothDevice.BOND_BONDED && cameraState.value is CameraStateNotBonded) {
+                        start()
+                    } else if (device?.bondState != BluetoothDevice.BOND_BONDED) {
+                        closeGatt()
+                        _cameraState.value = CameraStateNotBonded()
+                        onDisconnect()
+                    }
+                } catch (e: SecurityException) {
+                    failConnection("Bluetooth permission was revoked.")
                 }
-            } catch (e: SecurityException) {
-                _cameraState.value = CameraStateError(e, e.toString())
-                Log.e(MainActivity.TAG, e.toString())
             }
         }
     }
 
     init {
-        Log.d(MainActivity.TAG, "init")
-        context.registerReceiver(bondStateReceiver, IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED))
-        connectToDevice(context)
+        this.context.registerReceiver(bondStateReceiver, IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED))
     }
 
-    fun connectToDevice(context: Context) {
-        Log.d(MainActivity.TAG, "connectToDevice")
+    /** Called after the service has taken ownership and installed its state collector. */
+    fun start() {
+        if (disposed || gatt != null) return
+        device = try {
+            adapter?.getRemoteDevice(address)
+        } catch (e: IllegalArgumentException) {
+            Log.e(MainActivity.TAG, "Invalid camera address", e)
+            failConnection("Invalid camera address.")
+            return
+        }
         try {
-            device = bluetoothAdapter.getRemoteDevice(address)
-            if (device?.bondState == BluetoothDevice.BOND_BONDED) {
-                _cameraState.value = CameraStateConnecting()
-                gatt = device?.connectGatt(context, true, bluetoothGattCallback)
-            } else {
+            if (device?.bondState != BluetoothDevice.BOND_BONDED) {
                 _cameraState.value = CameraStateNotBonded()
-                Log.e(MainActivity.TAG, "Camera found, but not bonded.")
+                return
             }
+            _cameraState.value = CameraStateConnecting()
+            connection.open { device?.connectGatt(context, true, callback) }
+            if (gatt == null) failConnection("Could not create Bluetooth client.")
         } catch (e: SecurityException) {
-            _cameraState.value = CameraStateError(e, e.toString())
-            Log.e(MainActivity.TAG, e.toString())
+            failConnection("Bluetooth permission was revoked.")
+        } catch (e: IllegalArgumentException) {
+            Log.e(MainActivity.TAG, "Could not open Bluetooth connection", e)
+            failConnection("Could not open Bluetooth connection: ${e.message}")
         }
     }
 
-    fun notifyDisconnect() {
-        Log.d(MainActivity.TAG, "notifyDisconnect")
-        _cameraState.value = CameraStateGone()
-        remoteService = null
+    private fun discoverServices() {
+        _cameraState.value = CameraStateConnecting()
+        discoveryTimeout?.cancel()
+        try {
+            if (gatt?.discoverServices() != true) {
+                failConnection("Service discovery was rejected.")
+                return
+            }
+            discoveryTimeout = connectionScope.launch {
+                delay(OPERATION_TIMEOUT_MS)
+                failConnection("Service discovery timed out.")
+            }
+        } catch (e: SecurityException) {
+            failConnection("Bluetooth permission was revoked.")
+        }
+    }
+
+    private fun resetConnectionState() {
+        discoveryTimeout?.cancel()
+        rediscoverRequested = false
+        operations.clear()
         commandCharacteristic = null
         statusCharacteristic = null
-        resetOperationQueue()
-        currentOperation = null
-        onDisconnect()
+    }
+
+    private fun closeGatt() {
+        resetConnectionState()
+        try {
+            connection.release()
+        } catch (e: SecurityException) {
+            Log.w(MainActivity.TAG, "Bluetooth cleanup failed", e)
+        }
     }
 
     fun disconnectFromDevice() {
-        Log.d(MainActivity.TAG, "disconnectFromDevice")
+        if (disposed) return
+        recoveryJob?.cancel()
+        resetConnectionState()
         try {
-            gatt?.disconnect()
-            gatt?.close()
-            gatt = null
+            connection.dispose()
         } catch (e: SecurityException) {
-            Log.e(MainActivity.TAG, e.toString())
-            _cameraState.value = CameraStateError(e)
-        }
-        notifyDisconnect()
-    }
-
-    @Synchronized
-    fun enqueueOperation(operation: CameraBLEOperation) {
-        operationQueue.add(operation)
-        if (currentOperation == null) {
-            executeNextOperation()
+            Log.w(MainActivity.TAG, "Bluetooth cleanup failed", e)
+        } finally {
+            context.unregisterReceiver(bondStateReceiver)
+            connectionScope.cancel()
+            _cameraState.value = CameraStateGone()
+            onDisconnect()
         }
     }
 
-    @Synchronized
-    fun resetOperationQueue() {
-        operationQueue.clear()
-        currentOperation = null
+    private fun failConnection(reason: String) {
+        if (disposed) return
+        Log.e(MainActivity.TAG, reason)
+        closeGatt()
+        _cameraState.value = CameraStateError(null, reason)
+        onDisconnect()
+        // Retry setup at most twice, without replaying an uncertain camera write.
+        if (recoveryAttempts++ < MAX_RECOVERY_ATTEMPTS) {
+            recoveryJob?.cancel()
+            recoveryJob = connectionScope.launch {
+                delay(RECOVERY_DELAY_MS)
+                start()
+            }
+        }
     }
 
-    @OptIn(ExperimentalStdlibApi::class)
-    @Synchronized
-    fun executeNextOperation() {
-        if (currentOperation != null)
-            return
+    private fun enqueue(operation: CameraBLEOperation): Boolean =
+        !disposed && gatt != null && operations.enqueue(operation)
 
-        currentOperation = operationQueue.poll()
-
-        try {
-            when (currentOperation) {
-                is CameraBLEWrite -> {
-                    val op = currentOperation as CameraBLEWrite
-                    Log.d(MainActivity.TAG, "Writing: 0x${op.data.toHexString()}")
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        gatt?.writeCharacteristic(op.characteristic, op.data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
-                    } else {
-                        @Suppress("DEPRECATION", "Used for backwards compatibility on API<33")
-                        op.characteristic.setValue(op.data)
-                        @Suppress("DEPRECATION", "Used for backwards compatibility on API<33")
-                        gatt?.writeCharacteristic(op.characteristic)
-                    }
+    @Suppress("DEPRECATION")
+    private fun startOperation(operation: CameraBLEOperation): Boolean {
+        val client = gatt ?: return false
+        return try {
+            val accepted = when (operation) {
+                is CameraBLEWrite -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    client.writeCharacteristic(operation.characteristic, operation.data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == BluetoothStatusCodes.SUCCESS
+                } else {
+                    operation.characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                    operation.characteristic.setValue(operation.data) && client.writeCharacteristic(operation.characteristic)
                 }
-
-                is CameraBLERead -> {
-                    val op = currentOperation as CameraBLERead
-                    Log.d(MainActivity.TAG, "Reading from: ${op.characteristic.uuid}")
-                    gatt?.readCharacteristic(op.characteristic)
-                }
+                is CameraBLERead -> client.readCharacteristic(operation.characteristic)
                 is CameraBLESubscribe -> {
-                    val op = currentOperation as CameraBLESubscribe
-                    Log.d(MainActivity.TAG, "Subscribing to: ${op.characteristic.uuid}")
-                    gatt?.setCharacteristicNotification(op.characteristic, true)
-                    val descriptor = op.characteristic.getDescriptor(configDescriptorUUID)
+                    val descriptor = operation.characteristic.getDescriptor(configDescriptorUUID) ?: return false
+                    if (!client.setCharacteristicNotification(operation.characteristic, true)) return false
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        gatt?.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                        client.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothStatusCodes.SUCCESS
                     } else {
-                        @Suppress("DEPRECATION", "Used for backwards compatibility on API<33")
-                        descriptor?.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-                        @Suppress("DEPRECATION", "Used for backwards compatibility on API<33")
-                        gatt?.writeDescriptor(descriptor)
+                        descriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) && client.writeDescriptor(descriptor)
                     }
-                }
-
-                else -> return
-            }
-        } catch (e: SecurityException) {
-            _cameraState.value = CameraStateError(e)
-            Log.e(MainActivity.TAG, e.toString())
-        }
-    }
-
-    @Synchronized
-    fun operationComplete() {
-        currentOperation = null
-        executeNextOperation()
-    }
-
-    fun cameraBLEWriteComplete(status: Int) {
-        Log.d(MainActivity.TAG, "Writing complete: $status")
-        if (currentOperation is CameraBLEWrite) {
-            operationComplete()
-            if (status == 144) {
-                //The command failed. This is very likely a properly bonded camera with BLE remote setting disabled
-                _cameraState.value = CameraStateRemoteDisabled()
-            } //Other results are ignored. If this fails for any other reason - well if the button was not pressed, the user has to try again, but it does not change anything for this app.
-        }
-    }
-
-    @OptIn(ExperimentalStdlibApi::class)
-    fun cameraBLEReadComplete(status: Int, value: ByteArray) {
-        Log.d(MainActivity.TAG, "cameraBLEReadComplete: $status, 0x${value.toHexString()}")
-        if (currentOperation is CameraBLERead) {
-            val callback = (currentOperation as CameraBLERead).resultCallback
-            operationComplete()
-            callback(status, value)
-        }
-    }
-
-    fun cameraBLESubscribeComplete(status: Int) {
-        Log.d(MainActivity.TAG, "cameraBLESubscribeComplete: $status")
-        if (currentOperation is CameraBLESubscribe) { //Note: We do not check the status. If subscribing failed for some reason, the camera status is not reported. If this is due to a disconnect, the service will be terminated anyway, but if there is another reason, the rest of the app might still be usable
-            val name = (cameraState.value as? CameraStateIdentified)?.name
-            if (name == null)
-                Log.w(MainActivity.TAG, "Subscribe complete, but camera in unidentified state.")
-            _cameraState.value = CameraStateReady(name, focus = ReportedBoolean(), shutter = ReportedBoolean(), recording = ReportedBoolean(), emptySet(), emptySet())
-            operationComplete()
-        }
-    }
-
-    @OptIn(ExperimentalStdlibApi::class)
-    fun onCameraStatusUpdate(value: ByteArray) {
-        _cameraState.update {
-            if (it is CameraStateRemoteDisabled || it is CameraStateReady) {
-                val state = if (it is CameraStateRemoteDisabled)
-                    // The remote disabled state is the consequence of a failed write. This might be recoverable (i.e. user turned on the remote feature), so let's start with a fresh ready state.
-                    CameraStateReady(name, focus = ReportedBoolean(), shutter = ReportedBoolean(), recording = ReportedBoolean(), emptySet(), emptySet())
-                else
-                    it as CameraStateReady
-                when (value[1]) {
-                    0x3f.toByte() -> state.copy(focus = ReportedBoolean(value[2].and(0x20.toByte()) != 0.toByte()))
-                    0xa0.toByte() -> state.copy(shutter = ReportedBoolean(value[2].and(0x20.toByte()) != 0.toByte()))
-                    0xd5.toByte() -> state.copy(recording = ReportedBoolean(value[2].and(0x20.toByte()) != 0.toByte()))
-                    else -> state
-                }
-            } else // This should not happen. If it happens, it is probably the result of the BLE communication running in parallel to whatever changed the state. In this case it is probably not recoverable and should be ignored
-                it
-        }
-        Log.d(MainActivity.TAG, "Received status: 0x${value.toHexString()}")
-    }
-
-    fun executeCameraActionStep(action: CameraActionStep) {
-        Log.d(MainActivity.TAG, "executeCameraActionStep")
-        if (cameraState.value !is CameraStateReady)
-            return
-        try {
-            commandCharacteristic?.let { char ->
-                when (action) {
-                    is CAButton -> {
-                        enqueueOperation(CameraBLEWrite(char, byteArrayOf(0x01, action.getCode())))
-                        _cameraState.update {
-                            (it as? CameraStateReady)?.copy(
-                                pressedButtons = if (action.pressed) it.pressedButtons + action.button else it.pressedButtons - action.button
-                            ) ?: it
-                        }
-                    }
-                    is CAJog -> {
-                        enqueueOperation(CameraBLEWrite(char, byteArrayOf(0x02, action.getCode(), if (action.pressed) action.step else 0x00)))
-                        _cameraState.update {
-                            (it as? CameraStateReady)?.copy(
-                                pressedJogs = if (action.pressed) it.pressedJogs + action.jog else it.pressedJogs - action.jog
-                            ) ?: it
-                        }
-                    }
-                    else -> Unit //Countdown and wait for event are handled by service
                 }
             }
+            if (accepted && operation is CameraBLEWrite) pendingControls.accepted(operation.step)
+            accepted
         } catch (e: SecurityException) {
-            _cameraState.value = CameraStateError(e)
-            Log.e(MainActivity.TAG, e.toString())
+            Log.w(MainActivity.TAG, "Bluetooth permission was revoked", e)
+            throw e // Permission loss invalidates the connection; a busy/rejected command does not.
         }
+    }
+
+    private fun finishWrite(characteristic: BluetoothGattCharacteristic?, status: Int) {
+        operations.complete({ it is CameraBLEWrite && it.characteristic === characteristic }) { operation ->
+            val write = operation as CameraBLEWrite
+            if (status == BluetoothGatt.GATT_SUCCESS) pendingControls.acknowledged(write.step)
+            if (!rediscoverRequested && status != BluetoothGatt.GATT_SUCCESS) {
+                commandFailed(write, if (status == 144) "Camera Bluetooth remote is disabled." else "Camera command failed ($status).")
+                if (status == 144) _cameraState.value = CameraStateRemoteDisabled()
+            }
+        }
+    }
+
+    private fun commandFailed(write: CameraBLEWrite, reason: String) {
+        Log.w(MainActivity.TAG, reason)
+        // A completed/rejected write does not mean the link is dead. Never replay a press.
+        // Cleanup writes are best effort and must not recursively trigger more cleanup.
+        if (write.safetyRelease) return
+        operations.discardPending()
+        onActionFailed(reason)
+    }
+
+    private fun finishRead(characteristic: BluetoothGattCharacteristic, status: Int, value: ByteArray) {
+        operations.complete({ it is CameraBLERead && it.characteristic === characteristic }) {
+            if (!rediscoverRequested) (it as CameraBLERead).resultCallback(status, value)
+        }
+    }
+
+    private fun operationsDrained() {
+        if (rediscoverRequested) {
+            rediscoverRequested = false
+            discoverServices()
+        } else {
+            if (cameraState.value is CameraStateReady) recoveryAttempts = 0
+            onOperationsDrained()
+        }
+    }
+
+    private fun updateStatus(value: ByteArray) {
+        if (value.size < 3) return
+        _cameraState.update { state ->
+            val ready = when (state) {
+                is CameraStateReady -> state
+                is CameraStateRemoteDisabled -> CameraStateReady(name, ReportedBoolean(), ReportedBoolean(), ReportedBoolean(), pendingControls.pressedButtons, pendingControls.pressedJogs)
+                else -> return@update state
+            }
+            val reported = ReportedBoolean(value[2].and(0x20.toByte()) != 0.toByte())
+            when (value[1]) {
+                0x3f.toByte() -> ready.copy(focus = reported)
+                0xa0.toByte() -> ready.copy(shutter = reported)
+                0xd5.toByte() -> ready.copy(recording = reported)
+                else -> state
+            }
+        }
+    }
+
+    fun executeCameraActionStep(step: CameraActionStep) {
+        sendCameraActionStep(step, safetyRelease = false)
+    }
+
+    private fun sendCameraActionStep(step: CameraActionStep, safetyRelease: Boolean) {
+        if (disposed || cameraState.value !is CameraStateReady) return
+        val characteristic = commandCharacteristic ?: return
+        val data = when (step) {
+            is CAButton -> byteArrayOf(0x01, step.getCode())
+            is CAJog -> byteArrayOf(0x02, step.getCode(), if (step.pressed) step.step else 0x00)
+            else -> return
+        }
+        if (!enqueue(CameraBLEWrite(characteristic, data, step, safetyRelease))) return
+        // Track requested state immediately so rapid toggle clicks remain ordered, even before ACK.
+        // Immediately rejected requests return above without marking a button as pressed.
+        _cameraState.update { state ->
+            if (state !is CameraStateReady) state else when (step) {
+                is CAButton -> state.copy(pressedButtons = if (step.pressed) state.pressedButtons + step.button else state.pressedButtons - step.button)
+                is CAJog -> state.copy(pressedJogs = if (step.pressed) state.pressedJogs + step.jog else state.pressedJogs - step.jog)
+            }
+        }
+    }
+
+    fun releaseAllControls() {
+        if (disposed || cameraState.value !is CameraStateReady) return
+        operations.discardPending()
+        _cameraState.update { state ->
+            (state as? CameraStateReady)?.copy(pressedButtons = emptySet(), pressedJogs = emptySet()) ?: state
+        }
+        // Do not send unrelated AF/zoom/etc. releases: some models reject unsupported controls.
+        pendingControls.releases().forEach { sendCameraActionStep(it, safetyRelease = true) }
+    }
+
+    companion object {
+        private const val OPERATION_TIMEOUT_MS = 30_000L
+        private const val RECOVERY_DELAY_MS = 1_000L
+        private const val MAX_RECOVERY_ATTEMPTS = 2
     }
 }

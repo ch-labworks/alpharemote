@@ -20,6 +20,8 @@
     <string name="camera_advanced_bulb_note">You need to set your camera to bulb mode for this feature.</string>
     <string name="camera_advanced_interval_title">Intervalometer</string>
     <string name="camera_advanced_interval_duration">Interval</string>
+    <string name="camera_advanced_interval_refocus">Refocus after every Shot</string>
+    <string name="camera_advanced_interval_refocus_note">Checked: use autofocus; each shot waits for focus. Unchecked: half-press stays held (use AF-S to lock focus). Unavailable with focus bracketing.</string>
     <string name="camera_advanced_interval_count">Number of exposures</string>
     <string name="camera_advanced_interval_timer_label">Interval</string>
     <string name="camera_advanced_focus_bracketing_title">Focus Bracketing</string>
@@ -69,6 +71,10 @@
     <string name="settings_button_size_explanation">Adjust the size of the custom buttons in the notification area.</string>
     <string name="settings_button_size_smaller">−</string>
     <string name="settings_button_size_larger">+</string>
+
+    <string name="settings_self_timer_sound">Self-timer sound</string>
+    <string name="settings_self_timer_sound_explanation">Beep during the self-timer countdown, faster in the last three seconds. Uses notification volume and respects silent mode and Do Not Disturb.</string>
+    <string name="settings_self_timer_sound_toggle">Countdown beeps</string>
 
     <string name="settings_broadcast_control">Broadcast control</string>
     <string name="settings_broadcast_control_explanation">Allow other apps to send camera control commands via broadcasted intents? This allows automation through apps like "Tasker".</string>

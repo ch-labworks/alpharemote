@@ -19,6 +19,8 @@
     <string name="camera_advanced_bulb_note">Für diese Funktion musst du die Kamera auf Bulb stellen.</string>
     <string name="camera_advanced_interval_title">Intervalometer</string>
     <string name="camera_advanced_interval_duration">Intervall</string>
+    <string name="camera_advanced_interval_refocus">Nach jeder Aufnahme neu fokussieren</string>
+    <string name="camera_advanced_interval_refocus_note">Aktiviert: Autofokus verwenden; jede Aufnahme wartet auf die Fokussierung. Deaktiviert: Der Auslöser bleibt halb gedrückt (AF-S zur Fokusspeicherung verwenden). Nicht mit Focus Bracketing verfügbar.</string>
     <string name="camera_advanced_interval_count">Anzahl der Belichtungen</string>
     <string name="camera_advanced_interval_timer_label">Intervall</string>
     <string name="camera_advanced_focus_bracketing_title">Focus Bracketing</string>
@@ -68,6 +70,10 @@
     <string name="settings_button_size_explanation">Ändere die Größe der eigenen Tasten im Benachrichtigungsbereich.</string>
     <string name="settings_button_size_smaller">−</string>
     <string name="settings_button_size_larger">+</string>
+
+    <string name="settings_self_timer_sound">Selbstauslöser-Ton</string>
+    <string name="settings_self_timer_sound_explanation">Signaltöne während des Selbstauslösers, schneller in den letzten drei Sekunden. Verwendet die Benachrichtigungslautstärke und beachtet den Lautlos- und den Nicht-stören-Modus.</string>
+    <string name="settings_self_timer_sound_toggle">Signaltöne beim Countdown</string>
 
     <string name="settings_broadcast_control">Broadcast-Steuerung</string>
     <string name="settings_broadcast_control_explanation">Erlaube anderen Apps, über Broadcast Intents Steuerbefehle an die Kamera zu senden? Dies ermöglicht Automatisierungen durch Apps wie "Tasker".</string>
